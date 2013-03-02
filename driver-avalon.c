@@ -53,6 +53,15 @@ static inline uint8_t rev8(uint8_t d)
     return out;
 }
 
+static int is_valid_fd(int fd)
+{
+#ifndef WIN32
+    return fcntl(fd, F_GETFL) != -1 || errno != EBADF;
+#else
+    return 1;
+#endif
+}
+
 static int avalon_init_task(struct avalon_task *at,
 			    uint8_t reset, uint8_t ff, uint8_t fan,
 			    uint8_t timeout, uint8_t asic_num,
@@ -225,6 +234,17 @@ static int avalon_gets(int fd, uint8_t *buf, int read_count,
 
 	/* Read reply 1 byte at a time to get earliest tv_finish */
 	while (true) {
+		if (thr && thr->work_restart) {
+			if (opt_debug) {
+				applog(LOG_WARNING,
+				       "Avalon: Work restart at %.2f seconds",
+				       (float)(rc)/(float)AVALON_TIME_FACTOR);
+			}
+			return AVA_GETS_RESTART;
+		}
+		if (!is_valid_fd(fd))
+			return AVA_GETS_ERROR;
+
 		ret = read(fd, buf, 1);
 		if (ret < 0)
 			return AVA_GETS_ERROR;
@@ -252,14 +272,6 @@ static int avalon_gets(int fd, uint8_t *buf, int read_count,
 			return AVA_GETS_TIMEOUT;
 		}
 
-		if (thr && thr->work_restart) {
-			if (opt_debug) {
-				applog(LOG_WARNING,
-				       "Avalon: Work restart at %.2f seconds",
-				       (float)(rc)/(float)AVALON_TIME_FACTOR);
-			}
-			return AVA_GETS_RESTART;
-		}
 	}
 }
 
@@ -790,7 +802,7 @@ static int64_t avalon_scanhash(struct thr_info *thr, struct work **work,
 
 	hash_count = 0;
 	while (true) {
-		work_i0 = work_i1 = work_i2 = -1;
+		work_i0 = work_i1 = work_i2 = work_i3 = -1;
 
 		full = avalon_buffer_full(fd);
 		applog(LOG_DEBUG, "Avalon: Buffer full: %s",
@@ -799,17 +811,6 @@ static int64_t avalon_scanhash(struct thr_info *thr, struct work **work,
 			break;
 
 		ret = avalon_get_result(fd, &ar, thr, &tv_finish);
-		if (unlikely(ret == AVA_GETS_ERROR)) {
-			avalon_free_work(thr, info->bulk0);
-			avalon_free_work(thr, info->bulk1);
-			avalon_free_work(thr, info->bulk2);
-			avalon_free_work(thr, info->bulk3);
-			do_avalon_close(thr);
-			applog(LOG_ERR,
-			       "AVA%i: Comms error(read)", avalon->device_id);
-			dev_error(avalon, REASON_DEV_COMMS_ERROR);
-			return 0;
-		}
 		if (unlikely(ret == AVA_GETS_TIMEOUT)) {
 			timersub(&tv_finish, &tv_start, &elapsed);
 			applog(LOG_DEBUG, "Avalon: no nonce in (%ld.%06lds)",
@@ -822,6 +823,17 @@ static int64_t avalon_scanhash(struct thr_info *thr, struct work **work,
 			avalon_free_work(thr, info->bulk2);
 			avalon_free_work(thr, info->bulk3);
 			continue;
+		}
+		if (ret != AVA_GETS_OK) {
+			avalon_free_work(thr, info->bulk0);
+			avalon_free_work(thr, info->bulk1);
+			avalon_free_work(thr, info->bulk2);
+			avalon_free_work(thr, info->bulk3);
+			do_avalon_close(thr);
+			applog(LOG_ERR,
+			       "AVA%i: Comms error(read)", avalon->device_id);
+			dev_error(avalon, REASON_DEV_COMMS_ERROR);
+			return 0;
 		}
 		record_temp_fan(info, &ar, &(avalon->temp));
 
@@ -848,7 +860,7 @@ static int64_t avalon_scanhash(struct thr_info *thr, struct work **work,
 		if (work_i3 >= 0)
 			submit_nonce(thr, info->bulk3[work_i3], nonce);
 
-		hash_count += nonce;
+		hash_count += 0x7fffffff;
 
 		if (opt_debug) {
 			timersub(&tv_finish, &tv_start, &elapsed);
